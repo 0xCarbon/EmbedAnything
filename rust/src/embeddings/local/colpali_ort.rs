@@ -120,6 +120,82 @@ impl OrtColPaliEmbedder {
             dummy_input,
         })
     }
+
+    /// Create an OrtColPaliEmbedder from local files
+    pub fn from_local_files(
+        model_path: PathBuf,
+        tokenizer_path: PathBuf,
+        config_path: Option<PathBuf>,
+    ) -> Result<Self, E> {
+        // Load config - use provided config or default
+        let config: paligemma::Config = if let Some(config_path) = config_path {
+            let config_str = std::fs::read_to_string(config_path)?;
+            serde_json::from_str(&config_str).unwrap_or_else(|_| paligemma::Config::paligemma_3b_448())
+        } else {
+            paligemma::Config::paligemma_3b_448()
+        };
+
+        let image_size = config.vision_config.image_size;
+        let num_channels = config.vision_config.num_channels;
+        
+        // Load tokenizer from local file
+        let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(E::msg)?;
+
+        let pp = PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            ..Default::default()
+        };
+        let trunc = TruncationParams {
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            max_length: config.text_config.max_position_embeddings,
+            ..Default::default()
+        };
+
+        tokenizer
+            .with_padding(Some(pp))
+            .with_truncation(Some(trunc))
+            .unwrap();
+
+        tokenizer.set_encode_special_tokens(true);
+
+        let cuda = CUDAExecutionProvider::default();
+
+        if !cuda.is_available()? {
+            eprintln!("CUDAExecutionProvider is not available");
+        } else {
+            println!("Session is using CUDAExecutionProvider");
+        }
+
+        // Get physical core count (excluding hyperthreading)
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        // For CPU-bound workloads like ONNX inference, it's often better to use
+        // physical cores rather than logical cores to avoid context switching overhead
+        let optimal_threads = std::cmp::max(1, threads / 2);
+
+        // Load model from local file
+        let model = Session::builder()?
+            .with_execution_providers([
+                CUDAExecutionProvider::default().build(),
+                CoreMLExecutionProvider::default().build(),
+            ])?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(optimal_threads)? // Use optimal thread count
+            .with_inter_threads(1)? // Set inter-op parallelism to 1 when using GPU
+            .commit_from_file(model_path)?;
+
+        let dummy_prompt: &str = "Describe the image.\n";
+        let dummy_input = tokenize(&tokenizer, dummy_prompt.to_string())?;
+
+        Ok(Self {
+            model: RwLock::new(model),
+            tokenizer,
+            image_size,
+            num_channels,
+            dummy_input,
+        })
+    }
 }
 
 fn tokenize_batch(tokenizer: &Tokenizer, text_batch: &[&str]) -> Result<Array2<i64>, E> {
@@ -453,7 +529,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
-
+    
     lazy_static! {
         static ref MODEL: Mutex<OrtColPaliEmbedder> = Mutex::new(
             OrtColPaliEmbedder::new("akshayballal/colpali-v1.2-merged-onnx", None, None).unwrap()

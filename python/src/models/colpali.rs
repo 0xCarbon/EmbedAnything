@@ -4,6 +4,7 @@ use embed_anything::embeddings::local::colpali_ort::OrtColPaliEmbedder;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::PyResult;
+use std::path::PathBuf;
 
 use crate::EmbedData;
 #[pyclass]
@@ -41,6 +42,25 @@ impl ColpaliModel {
         path_in_repo: Option<&str>,
     ) -> PyResult<Self> {
         let model = OrtColPaliEmbedder::new(model_id, revision, path_in_repo)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self {
+            model: Box::new(model),
+        })
+    }
+
+    /// Create a ColPali model from local ONNX files
+    #[staticmethod]
+    #[pyo3(signature = (model_path, tokenizer_path, config_path=None))]
+    pub fn from_local_files(
+        model_path: &str,
+        tokenizer_path: &str,
+        config_path: Option<&str>,
+    ) -> PyResult<Self> {
+        let model_path = PathBuf::from(model_path);
+        let tokenizer_path = PathBuf::from(tokenizer_path);
+        let config_path = config_path.map(PathBuf::from);
+        
+        let model = OrtColPaliEmbedder::from_local_files(model_path, tokenizer_path, config_path)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             model: Box::new(model),
