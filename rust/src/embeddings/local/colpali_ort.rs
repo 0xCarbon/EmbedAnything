@@ -99,12 +99,21 @@ impl OrtColPaliEmbedder {
         // physical cores rather than logical cores to avoid context switching overhead
         let optimal_threads = std::cmp::max(1, threads / 2);
 
+        // Allow configuring optimization level via environment variable
+        let optimization_level = match std::env::var("ONNX_OPTIMIZATION_LEVEL").as_deref() {
+            Ok("0") => GraphOptimizationLevel::Disable,
+            Ok("1") => GraphOptimizationLevel::Level1,
+            Ok("2") => GraphOptimizationLevel::Level2,
+            Ok("3") => GraphOptimizationLevel::Level3,
+            _ => GraphOptimizationLevel::Level1, // Default to Level1 for stability
+        };
+
         let model = Session::builder()?
             .with_execution_providers([
                 CUDAExecutionProvider::default().build(),
                 CoreMLExecutionProvider::default().build(),
             ])?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_optimization_level(optimization_level)?
             .with_intra_threads(optimal_threads)? // Use optimal thread count
             .with_inter_threads(1)? // Set inter-op parallelism to 1 when using GPU
             .commit_from_file(weights_filename)?;
@@ -174,13 +183,22 @@ impl OrtColPaliEmbedder {
         // physical cores rather than logical cores to avoid context switching overhead
         let optimal_threads = std::cmp::max(1, threads / 2);
 
+        // Allow configuring optimization level via environment variable
+        let optimization_level = match std::env::var("ONNX_OPTIMIZATION_LEVEL").as_deref() {
+            Ok("0") => GraphOptimizationLevel::Disable,
+            Ok("1") => GraphOptimizationLevel::Level1,
+            Ok("2") => GraphOptimizationLevel::Level2,
+            Ok("3") => GraphOptimizationLevel::Level3,
+            _ => GraphOptimizationLevel::Level1, // Default to Level1 for stability
+        };
+
         // Load model from local file
         let model = Session::builder()?
             .with_execution_providers([
                 CUDAExecutionProvider::default().build(),
                 CoreMLExecutionProvider::default().build(),
             ])?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_optimization_level(optimization_level)?
             .with_intra_threads(optimal_threads)? // Use optimal thread count
             .with_inter_threads(1)? // Set inter-op parallelism to 1 when using GPU
             .commit_from_file(model_path)?;
