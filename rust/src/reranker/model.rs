@@ -5,7 +5,7 @@ use candle_core::{Device, Tensor};
 use hf_hub::{api::sync::Api, Repo};
 use ndarray::Array2;
 use ort::{
-    execution_providers::{CUDAExecutionProvider, CoreMLExecutionProvider, ExecutionProvider},
+    execution_providers::{CUDAExecutionProvider, ExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
 };
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};

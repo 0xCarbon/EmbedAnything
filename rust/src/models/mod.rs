@@ -8,4 +8,7 @@ pub mod paligemma;
 pub mod siglip;
 pub mod with_tracing;
 pub mod qwen3;
+pub mod qwen25_language;
+pub mod qwen25_vl;
+pub mod colqwen;
 pub mod quantized_qwen3;
