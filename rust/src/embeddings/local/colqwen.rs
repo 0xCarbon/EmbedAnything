@@ -1,7 +1,7 @@
 use crate::embeddings::embed::{EmbedData, EmbeddingResult};
 use crate::embeddings::select_device;
 use crate::models::colqwen::Model;
-use crate::models::qwen25_vl::Config;
+use crate::models::qwen25_vl::{Config, PreprocessorConfig};
 use anyhow::Error as E;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -34,6 +34,7 @@ pub struct ColQwenEmbedder {
     pub model: RwLock<Model>,
     pub tokenizer: Tokenizer,
     pub config: Config,
+    pub preprocessor_config: PreprocessorConfig,
     pub device: Device,
     dtype: DType,
 }
@@ -53,17 +54,21 @@ impl ColQwenEmbedder {
             )),
         };
 
-        let (tokenizer_filename, weights_filename, config_filename) = {
+        let (tokenizer_filename, weights_filename, config_filename, preprocessor_config_filename) = {
             let tokenizer = repo.get("tokenizer.json")?;
             let weights = hub_load_safetensors(&repo, "model.safetensors.index.json")?;
             let config = repo.get("config.json")?;
+            let preprocessor_config = repo.get("preprocessor_config.json")?;
 
-            (tokenizer, weights, config)
+            (tokenizer, weights, config, preprocessor_config)
         };
 
         // Load config from file
         let config_str = std::fs::read_to_string(config_filename)?;
         let config: Config = serde_json::from_str(&config_str)?;
+
+        let preprocessor_config_str = std::fs::read_to_string(preprocessor_config_filename)?;
+        let preprocessor_config: PreprocessorConfig = serde_json::from_str(&preprocessor_config_str)?;
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
@@ -101,6 +106,7 @@ impl ColQwenEmbedder {
             model: RwLock::new(model),
             tokenizer,
             config,
+            preprocessor_config,
             device,
             dtype,
         })
@@ -135,7 +141,18 @@ impl ColQwenEmbedder {
                 config_file.display()
             ));
         }
-        
+
+        let preprocessor_config_file = model_path.join("preprocessor_config.json");
+        if !preprocessor_config_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Preprocessor config file not found: {}. ColQwen models require a preprocessor_config.json file.",
+                preprocessor_config_file.display()
+            ));
+        }
+
+        let preprocessor_config_str = std::fs::read_to_string(preprocessor_config_file)?;
+        let preprocessor_config: PreprocessorConfig = serde_json::from_str(&preprocessor_config_str)?;
+
         let config_str = std::fs::read_to_string(config_file)?;
         let config: Config = serde_json::from_str(&config_str)?;
 
@@ -187,15 +204,57 @@ impl ColQwenEmbedder {
             model: RwLock::new(model),
             tokenizer,
             config,
+            preprocessor_config,
             device,
             dtype,
         })
     }
 
+    /// Calculate optimal image size preserving original dimensions when possible
+    /// ColQwen requires: 1) Perfect square number of patches, 2) Grid size divisible by spatial_merge_size (2)
+    fn calculate_adaptive_image_size(&self, original_width: u32, original_height: u32) -> (u32, u32) {
+        let max_pixels = self.preprocessor_config.max_pixels;
+        let patch_size = self.config.vision_config.patch_size as u32;
+        let spatial_merge_size = self.config.vision_config.spatial_merge_size as u32;
+        
+        // Calculate max number of patches that fits within max_pixels
+        let max_patches = max_pixels / (patch_size * patch_size) as usize;
+        
+        // Find largest square grid that fits and is divisible by spatial_merge_size
+        let max_grid_side = (max_patches as f64).sqrt() as u32;
+        
+        // Ensure grid size is divisible by spatial_merge_size (round down to nearest multiple)
+        let max_grid_side = (max_grid_side / spatial_merge_size) * spatial_merge_size;
+        
+        // Calculate actual image dimensions for this grid
+        let max_image_side = max_grid_side * patch_size;
+        
+        let original_pixels = (original_width * original_height) as usize;
+        let max_image_pixels = (max_image_side * max_image_side) as usize;
+        
+        // If original image fits within our constrained max size, use optimal square size
+        if original_pixels <= max_image_pixels {
+            // For smaller images, find the best square grid that accommodates the original
+            let original_max_side = original_width.max(original_height);
+            let needed_grid_side = (original_max_side + patch_size - 1) / patch_size;
+            
+            // Round up to nearest multiple of spatial_merge_size
+            let grid_side = ((needed_grid_side + spatial_merge_size - 1) / spatial_merge_size) * spatial_merge_size;
+            
+            // Ensure we don't exceed max constraints
+            let grid_side = grid_side.min(max_grid_side);
+            
+            let image_side = grid_side * patch_size;
+            return (image_side, image_side);
+        }
+        
+        // Original is too large, use maximum allowed square size
+        (max_image_side, max_image_side)
+    }
+
     fn images_to_tensor(
         &self,
         pages: &[DynamicImage],
-        image_size: usize,
     ) -> anyhow::Result<Tensor> {
         if pages.is_empty() {
             return Err(anyhow::anyhow!("Cannot process empty pages array"));
@@ -203,19 +262,28 @@ impl ColQwenEmbedder {
         
         let mut images = vec![];
         for page in pages.iter() {
+            // Calculate adaptive image size based on original dimensions
+            let (target_width, target_height) = self.calculate_adaptive_image_size(
+                page.width(), 
+                page.height()
+            );
+            
             let img = page.resize_to_fill(
-                image_size as u32,
-                image_size as u32,
+                target_width,
+                target_height,
                 image::imageops::FilterType::Triangle,
             );
             let img = img.to_rgb8();
             let img = img.into_raw();
             
             // Create tensor following ColPali's approach but with temporal dimension for Qwen2.5-VL
-            let img = Tensor::from_vec(img, (image_size, image_size, 3), &self.device)?
+            let img = Tensor::from_vec(img, (target_height as usize, target_width as usize, 3), &self.device)?
                 .permute((2, 0, 1))?  // (C, H, W)
                 .to_dtype(self.dtype)?
                 .affine(2. / 255., -1.)?; // Normalize to [-1, 1]
+            
+            // Ensure result is in correct dtype after affine operation
+            let img = img.to_dtype(self.dtype)?;
             
             // Add temporal dimension: (C, H, W) -> (C, T, H, W) where T=1
             let img = img.unsqueeze(1)?; // (C, 1, H, W)
@@ -240,7 +308,8 @@ impl ColQwenEmbed for ColQwenEmbedder {
             let tokens = tokenize_batch(&self.tokenizer, batch.to_vec(), &self.device)?;
             
             let model = self.model.read().unwrap();
-            let embeddings = model.get_query_embeddings(&tokens)?;
+            let embeddings = model.get_query_embeddings(&tokens)?
+                .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
             
             // Convert to EmbeddingResult format
             for i in 0..batch.len() {
@@ -258,7 +327,8 @@ impl ColQwenEmbed for ColQwenEmbedder {
     fn embed_query(&self, query: &str) -> anyhow::Result<Vec<EmbedData>> {
         let tokens = tokenize_batch(&self.tokenizer, vec![query], &self.device)?;
         let model = self.model.read().unwrap();
-        let embeddings = model.get_query_embeddings(&tokens)?;
+        let embeddings = model.get_query_embeddings(&tokens)?
+            .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
         
         let embedding_tensor = embeddings.get(0)?;
         // ColQwen produces multi-vector embeddings (one per token)
@@ -301,18 +371,16 @@ impl ColQwenEmbed for ColQwenEmbedder {
                         continue; // Skip empty batches
                     }
                     
-                    // For Qwen2.5-VL, use a reasonable image size
-                    // The calculated size (112 * 14 = 1568) might be too large, let's use a more reasonable size
-                    // Based on typical VLM expectations, 448-896 is common
-                    let image_size = 448; // Standard size for many vision-language models
-                    let images_tensor = self.images_to_tensor(page_batch, image_size)?;
+                    // For Qwen2.5-VL, use adaptive image sizing for optimal quality
+                    let images_tensor = self.images_to_tensor(page_batch)?;
                     
                     // Create dummy text tokens for image processing
                     let dummy_text = vec!["Describe the image."; page_batch.len()];
                     let tokens = tokenize_batch(&self.tokenizer, dummy_text, &self.device)?;
                     
                     let model = self.model.read().unwrap();
-                    let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?;
+                    let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?
+                        .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
                     
                     for (i, _page) in page_batch.iter().enumerate() {
                         let embedding_tensor = embeddings.get(i)?;
@@ -345,17 +413,15 @@ impl ColQwenEmbed for ColQwenEmbedder {
     ) -> anyhow::Result<EmbedData> {
         let image = image::ImageReader::open(&image_path)?.decode()?;
         
-        // For Qwen2.5-VL, use a reasonable image size
-        // The calculated size (112 * 14 = 1568) might be too large, let's use a more reasonable size
-        // Based on typical VLM expectations, 448-896 is common
-        let image_size = 448; // Standard size for many vision-language models
-        let images_tensor = self.images_to_tensor(&[image], image_size)?;
+        // For Qwen2.5-VL, use adaptive image sizing for optimal quality
+        let images_tensor = self.images_to_tensor(&[image])?;
         
         // Create dummy text token for image processing
         let tokens = tokenize_batch(&self.tokenizer, vec!["Describe the image."], &self.device)?;
         
         let model = self.model.read().unwrap();
-        let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?;
+        let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?
+            .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
         
         let embedding_tensor = embeddings.get(0)?;
         // ColQwen produces multi-vector embeddings (one per token)
@@ -384,18 +450,16 @@ impl ColQwenEmbed for ColQwenEmbedder {
             images.push(image);
         }
         
-        // For Qwen2.5-VL, use a reasonable image size
-        // The calculated size (112 * 14 = 1568) might be too large, let's use a more reasonable size
-        // Based on typical VLM expectations, 448-896 is common
-        let image_size = 448; // Standard size for many vision-language models
-        let images_tensor = self.images_to_tensor(&images, image_size)?;
+        // For Qwen2.5-VL, use adaptive image sizing for optimal quality
+        let images_tensor = self.images_to_tensor(&images)?;
         
         // Create dummy text tokens for image processing
         let dummy_text = vec!["Describe the image."; images.len()];
         let tokens = tokenize_batch(&self.tokenizer, dummy_text, &self.device)?;
         
         let model = self.model.read().unwrap();
-        let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?;
+        let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?
+            .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
         
         let mut all_embeddings = Vec::new();
         for (i, image_path) in image_paths.iter().enumerate() {

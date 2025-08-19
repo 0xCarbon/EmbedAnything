@@ -40,6 +40,7 @@ pub struct ColPaliEmbedder {
     pub device: Device,
     dtype: DType,
     dummy_input: Tensor,
+    image_size: usize,
 }
 
 impl ColPaliEmbedder {
@@ -70,6 +71,9 @@ impl ColPaliEmbedder {
         };
 
         let config: paligemma::Config = paligemma::Config::paligemma_3b_448();
+        
+        // ColPali uses the vision config image size (448 for paligemma_3b_448)
+        let image_size = config.vision_config.image_size;
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
@@ -110,6 +114,7 @@ impl ColPaliEmbedder {
             device,
             dtype,
             dummy_input,
+            image_size,
         })
     }
 
@@ -151,6 +156,9 @@ impl ColPaliEmbedder {
         };
 
         let config: paligemma::Config = paligemma::Config::paligemma_3b_448();
+        
+        // ColPali uses the vision config image size (448 for paligemma_3b_448)
+        let image_size = config.vision_config.image_size;
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
 
@@ -191,6 +199,7 @@ impl ColPaliEmbedder {
             device,
             dtype,
             dummy_input,
+            image_size,
         })
     }
 
@@ -271,7 +280,7 @@ impl ColPaliEmbed for ColPaliEmbedder {
     ) -> anyhow::Result<EmbedData> {
         let pixel_values = load_image(
             image_path,
-            self.config.vision_config.image_size,
+            self.image_size,
             &self.device,
         )?
         .unsqueeze(0)?
@@ -293,7 +302,7 @@ impl ColPaliEmbed for ColPaliEmbedder {
     fn embed_image_batch(&self, image_paths: &[PathBuf]) -> anyhow::Result<Vec<EmbedData>> {
         let pixel_values = load_images(
             image_paths,
-            self.config.vision_config.image_size,
+            self.image_size,
             &self.device,
         )?
         .to_dtype(self.dtype)?;
@@ -319,7 +328,7 @@ impl ColPaliEmbed for ColPaliEmbedder {
             let end_page = start_page + batch.len();
             let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
             let page_images = self
-                .images_to_tensor(batch, self.config.vision_config.image_size)?
+                .images_to_tensor(batch, self.image_size)?
                 .to_device(&self.device)?
                 .to_dtype(dtype)?;
             let dummy_input = self.dummy_input.repeat((page_images.dims()[0], 0))?;

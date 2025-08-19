@@ -14,6 +14,7 @@ pub struct Model {
     #[allow(dead_code)]
     dim: usize,
     mask_non_image_embeddings: bool,
+    dtype: DType,
 }
 
 impl Model {
@@ -22,6 +23,7 @@ impl Model {
             &config.vision_config,
             &config.text_config,
             vb.pp("visual"),
+            dtype,
         )?;
         
         let language_model = LanguageModel::new(
@@ -45,62 +47,12 @@ impl Model {
             config: config.clone(),
             dim,
             mask_non_image_embeddings,
+            dtype,
         })
     }
     
-    /// Forward pass following ColQwen2.5 architecture
-    /// This matches the Python implementation's forward method
-    pub fn forward(
-        &self, 
-        input_ids: &Tensor, 
-        attention_mask: &Tensor,
-        pixel_values: Option<&Tensor>,
-        _image_grid_thw: Option<&Tensor>
-    ) -> Result<Tensor> {
-        // Get last hidden states from language model
-        let last_hidden_states = if let Some(pixel_values) = pixel_values {
-            // Process vision inputs and inject into language model
-            let vision_embeds = self.visual.forward(pixel_values)?;
-            self.language_model.forward_with_vision(
-                input_ids, 
-                Some(&vision_embeds)
-            )?
-        } else {
-            // Text-only forward pass
-            self.language_model.forward(input_ids)?
-        };
-        
-        // Apply custom projection to get ColPali-style embeddings
-        let proj = self.custom_text_proj.forward(&last_hidden_states)?;
-        
-        // L2 normalization
-        let norm = proj.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
-        let proj = proj.broadcast_div(&norm)?;
-        
-        // Apply attention mask (only use the mask for the original sequence length)
-        let attention_mask_expanded = attention_mask.unsqueeze(D::Minus1)?;
-        let proj = if pixel_values.is_some() {
-            // For vision+text: need to handle the concatenated sequence
-            // For now, just apply mask to the text portion
-            // TODO: Implement proper vision+text masking
-            proj
-        } else {
-            // Text-only: apply mask normally
-            proj.broadcast_mul(&attention_mask_expanded)?
-        };
-        
-        // Optional: mask non-image embeddings (if enabled)
-        if self.mask_non_image_embeddings {
-            if let Some(_pixel_values) = pixel_values {
-                // Create image mask (tokens with image_token_id)
-                let image_token_id = self.config.image_token_id() as i64;
-                let image_mask = input_ids.eq(image_token_id)?.unsqueeze(D::Minus1)?;
-                return Ok(proj.broadcast_mul(&image_mask.to_dtype(proj.dtype())?)?)
-            }
-        }
-        
-        Ok(proj)
-    }
+    // Note: Removed complex forward method - now using ColPali's simpler pattern
+    // where get_query_embeddings and get_document_embeddings call the language model directly
     
     /// Forward pass for text-only input (legacy)
     pub fn forward_text(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -129,18 +81,37 @@ impl Model {
 }
 
 impl Model {
-    /// Get query embeddings (for text queries)
+    /// Get query embeddings (for text queries) - ColPali style without explicit attention masks
     pub fn get_query_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        // Create attention mask (all ones for valid tokens) - use F32 to match model expectations
-        let attention_mask = Tensor::ones(input_ids.shape(), candle_core::DType::F32, input_ids.device())?;
-        self.forward(input_ids, &attention_mask, None, None)
+        // Follow ColPali pattern: direct language model call without attention masks
+        let last_hidden_states = self.language_model.forward(input_ids)?;
+        
+        // Apply custom projection to get ColPali-style embeddings
+        let proj = self.custom_text_proj.forward(&last_hidden_states)?;
+        
+        // L2 normalization
+        let norm = proj.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+        let proj = proj.broadcast_div(&norm)?;
+        
+        Ok(proj)
     }
     
-    /// Get document embeddings (for images/documents)
+    /// Get document embeddings (for images/documents) - simplified approach
     pub fn get_document_embeddings(&self, input_ids: &Tensor, pixel_values: &Tensor) -> Result<Tensor> {
-        // Create attention mask (all ones for valid tokens) - use F32 to match model expectations
-        let attention_mask = Tensor::ones(input_ids.shape(), candle_core::DType::F32, input_ids.device())?;
-        self.forward(input_ids, &attention_mask, Some(pixel_values), None)
+        // Process vision inputs
+        let vision_embeds = self.visual.forward(pixel_values)?;
+        
+        // Forward with vision embeddings (simplified)
+        let last_hidden_states = self.language_model.forward_with_vision(input_ids, Some(&vision_embeds))?;
+        
+        // Apply custom projection to get ColPali-style embeddings
+        let proj = self.custom_text_proj.forward(&last_hidden_states)?;
+        
+        // L2 normalization
+        let norm = proj.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+        let proj = proj.broadcast_div(&norm)?;
+        
+        Ok(proj)
     }
 }
 

@@ -135,6 +135,58 @@ impl Default for TextConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreprocessorConfig {
+    pub do_convert_rgb: bool,
+    pub do_normalize: bool,
+    pub do_rescale: bool,
+    pub do_resize: bool,
+    pub image_mean: Vec<f32>,
+    pub image_processor_type: String,
+    pub image_std: Vec<f32>,
+    pub max_pixels: usize,
+    pub merge_size: u32,
+    pub min_pixels: usize,
+    pub patch_size: u32,
+    pub processor_class: String,
+    pub resample: u32,
+    pub rescale_factor: f64,
+    pub size: SizeConfig,
+    pub temporal_patch_size: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SizeConfig {
+    pub longest_edge: usize,
+    pub shortest_edge: usize,
+}
+
+impl Default for PreprocessorConfig {
+    fn default() -> Self {
+        Self {
+            do_convert_rgb: true,
+            do_normalize: true,
+            do_rescale: true,
+            do_resize: true,
+            image_mean: vec![0.48145466, 0.4578275, 0.40821073],
+            image_processor_type: "Qwen2VLImageProcessor".to_string(),
+            image_std: vec![0.26862954, 0.26130258, 0.27577711],
+            max_pixels: 12845056,
+            merge_size: 2,
+            min_pixels: 3136,
+            patch_size: 14,
+            processor_class: "ColQwen2_5_Processor".to_string(),
+            resample: 3,
+            rescale_factor: 0.00392156862745098,
+            size: SizeConfig {
+                longest_edge: 12845056,
+                shortest_edge: 3136,
+            },
+            temporal_patch_size: 2,
+        }
+    }
+}
+
 /// Overall Qwen2.5-VL Configuration - matches Python implementation
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -273,16 +325,16 @@ impl Module for VisionPatchEmbed {
                             ))?;
                             // Extract only the portion corresponding to the first temporal slice
                             let single_temporal_size = self.in_channels * self.patch_size * self.patch_size;
-                            full_weight_2d.narrow(1, 0, single_temporal_size)?
+                            full_weight_2d.narrow(1, 0, single_temporal_size)?.contiguous()? // Fix non-contiguous tensor
                         } else {
                             self.weight.reshape((
                                 self.hidden_size,
                                 expected_input_size,
-                            ))?
+                            ))?.contiguous()? // Ensure contiguous for matmul
                         };
                         
                         // Apply convolution as matrix multiplication
-                        let output_patch = weight_2d.matmul(&patch_flat.unsqueeze(1)?)?.squeeze(1)?; // (hidden_size,)
+                        let output_patch = weight_2d.matmul(&patch_flat.contiguous()?.unsqueeze(1)?)?.squeeze(1)?; // (hidden_size,)
                         
                         all_patches.push(output_patch);
                     }
@@ -345,12 +397,12 @@ impl Module for VisionAttention {
         
         // Scaled dot-product attention
         let scale = (self.head_dim as f64).sqrt().recip();
-        let attn = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
+        let attn = q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
         let attn = (attn * scale)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         
-        let out = attn.matmul(&v)?;
-        let out = out.transpose(1, 2)?; // (B, N, num_heads, head_dim)
+        let out = attn.matmul(&v.contiguous()?)?;
+        let out = out.transpose(1, 2)?.contiguous()?; // (B, N, num_heads, head_dim)
         let out = out.reshape((b, n, self.num_heads * self.head_dim))?;
         
         self.proj.forward(&out)
@@ -509,10 +561,10 @@ impl PatchMerger {
         
         let xs = Tensor::stack(&merged_patches, 1)?; // (B, new_h * new_w, spatial_merge_size^2 * C)
         
-        // Apply MLP with GELU activation
-        let xs = self.mlp[0].forward(&xs)?;
+        // Apply MLP with GELU activation - ensure contiguous tensors
+        let xs = self.mlp[0].forward(&xs.contiguous()?)?;
         let xs = Activation::Gelu.forward(&xs)?;
-        self.mlp[1].forward(&xs)
+        self.mlp[1].forward(&xs.contiguous()?)
     }
 }
 
@@ -522,10 +574,11 @@ pub struct VisionTransformer {
     patch_embed: VisionPatchEmbed,
     blocks: Vec<VisionBlock>,
     merger: PatchMerger,
+    dtype: candle_core::DType,
 }
 
 impl VisionTransformer {
-    pub fn new(vision_cfg: &VisionConfig, text_cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(vision_cfg: &VisionConfig, text_cfg: &TextConfig, vb: VarBuilder, dtype: candle_core::DType) -> Result<Self> {
         let patch_embed = VisionPatchEmbed::new(vision_cfg, vb.pp("patch_embed"))?;
         
         let mut blocks = Vec::with_capacity(vision_cfg.depth);
@@ -540,13 +593,16 @@ impl VisionTransformer {
             patch_embed,
             blocks,
             merger,
+            dtype,
         })
     }
 }
 
 impl Module for VisionTransformer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = self.patch_embed.forward(xs)?;
+        // Ensure input is in correct dtype
+        let xs = xs.to_dtype(self.dtype)?;
+        let xs = self.patch_embed.forward(&xs)?;
         
         let mut xs = xs;
         for block in &self.blocks {

@@ -143,12 +143,12 @@ impl Module for Attention {
         
         // Scaled dot-product attention
         let scale = (self.head_dim as f64).sqrt().recip();
-        let attn_weights = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
+        let attn_weights = q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
         let attn_weights = attn_weights.affine(scale, 0.0)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         
-        let attn_output = attn_weights.matmul(&v)?;
-        let attn_output = attn_output.transpose(1, 2)?; // (B, seq_len, num_heads, head_dim)
+        let attn_output = attn_weights.matmul(&v.contiguous()?)?;
+        let attn_output = attn_output.transpose(1, 2)?.contiguous()?; // (B, seq_len, num_heads, head_dim)
         let attn_output = attn_output.reshape((b, seq_len, self.num_heads * self.head_dim))?;
         
         self.o_proj.forward(&attn_output)
@@ -158,13 +158,13 @@ impl Module for Attention {
 impl Attention {
     fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
         if n_rep == 1 {
-            return Ok(x.clone());
+            return Ok(x.contiguous()?);
         }
         
         let (b, n_kv_heads, seq_len, head_dim) = x.dims4()?;
         let x = x.unsqueeze(2)?; // (B, n_kv_heads, 1, seq_len, head_dim)
         let x = x.expand((b, n_kv_heads, n_rep, seq_len, head_dim))?;
-        x.reshape((b, n_kv_heads * n_rep, seq_len, head_dim))
+        x.reshape((b, n_kv_heads * n_rep, seq_len, head_dim))?.contiguous()
     }
 }
 
