@@ -9,6 +9,8 @@ use super::local::bert::{BertEmbed, BertEmbedder, SparseBertEmbedder};
 use super::local::clip::ClipEmbedder;
 use super::local::colpali::{ColPaliEmbed, ColPaliEmbedder};
 use super::local::jina::{JinaEmbed, JinaEmbedder};
+// Note: JinaV4 imports kept for potential future use
+// use super::local::jina_v4::{JinaV4Embed, JinaV4Embedder};
 use super::local::model2vec::Model2VecEmbedder;
 use super::local::modernbert::ModernBertEmbedder;
 use super::local::qwen3::{Qwen3Embed, Qwen3Embedder};

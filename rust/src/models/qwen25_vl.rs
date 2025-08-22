@@ -612,3 +612,52 @@ impl Module for VisionTransformer {
         self.merger.forward(&xs)
     }
 }
+
+impl VisionTransformer {
+    /// Forward method for pre-flattened patches from transformers preprocessing
+    pub fn forward_flattened_patches(&self, patches: &Tensor) -> Result<Tensor> {
+        // Input: flattened patches (num_patches, channel * temporal_patch_size * patch_size * patch_size)  
+        // Need to convert to: (batch_size, num_patches, hidden_size)
+        
+        let patches = patches.to_dtype(self.dtype)?;
+        
+        // Convert patch features to hidden dimension using patch embedding weights
+        // This replicates what VisionPatchEmbed does but for already-flattened patches
+        let patch_feature_dim = patches.dim(1)?;
+        let expected_patch_dim = 3 * 2 * 14 * 14; // channel * temporal_patch_size * patch_size * patch_size
+        
+        if patch_feature_dim != expected_patch_dim {
+            return Err(candle_core::Error::Msg(format!(
+                "Expected patch feature dim {}, got {}", 
+                expected_patch_dim, patch_feature_dim
+            )));
+        }
+        
+        // Apply patch embedding projection: (num_patches, patch_feature_dim) -> (num_patches, hidden_size)
+        // Use the Conv3d weights from patch_embed but as a 2D linear transformation
+        let weight_2d = self.patch_embed.weight.reshape((self.patch_embed.hidden_size, patch_feature_dim))?;
+        let projected = patches.matmul(&weight_2d.t()?.contiguous()?)?; // (num_patches, hidden_size)
+        
+        // Add bias if present
+        let mut xs = if let Some(bias) = &self.patch_embed.bias {
+            let bias_expanded = bias.unsqueeze(0)?.broadcast_as(projected.shape())?;
+            projected.add(&bias_expanded)?
+        } else {
+            projected
+        };
+        
+        // Add batch dimension: (num_patches, hidden_size) -> (1, num_patches, hidden_size)
+        xs = xs.unsqueeze(0)?;
+        
+        // Process through transformer blocks
+        for block in &self.blocks {
+            xs = block.forward(&xs)?;
+        }
+        
+        // Apply merger (spatial merge for ColPali)
+        let merged = self.merger.forward(&xs)?;
+        
+        // Remove batch dimension to match expected 2D output: (1, num_patches, hidden_size) -> (num_patches, hidden_size)
+        merged.squeeze(0)
+    }
+}

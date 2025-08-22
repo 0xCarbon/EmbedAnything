@@ -6,7 +6,9 @@ pub mod colpali;
 #[cfg(feature = "ort")]
 pub mod colpali_ort;
 pub mod colqwen;
+pub mod granite;
 pub mod jina;
+pub mod jina_v4;
 pub mod model_info;
 pub mod modernbert;
 #[cfg(feature = "ort")]

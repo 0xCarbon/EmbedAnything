@@ -286,21 +286,160 @@ impl Module for LanguageModel {
 }
 
 impl LanguageModel {
-    /// Forward with vision embeddings injected
+    /// Forward with vision embeddings injected at proper token positions
     pub fn forward_with_vision(&self, input_ids: &Tensor, vision_embeds: Option<&Tensor>) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let text_embeds = self.embed_tokens.forward(input_ids)?;
         
-        // If vision embeddings are provided, inject them at appropriate positions
-        if let Some(vision_embeds) = vision_embeds {
-            // For simplicity, prepend vision embeddings to text embeddings
-            // In a full implementation, you'd need to handle vision token positions properly
-            xs = Tensor::cat(&[vision_embeds, &xs], 1)?;
-        }
+        // If vision embeddings are provided, integrate them properly
+        let xs = if let Some(vision_embeds) = vision_embeds {
+            self.integrate_vision_embeddings(&text_embeds, vision_embeds, input_ids)?
+        } else {
+            text_embeds
+        };
         
+        // Process through transformer layers
+        let mut xs = xs;
         for layer in &self.layers {
             xs = layer.forward(&xs)?;
         }
         
         self.norm.forward(&xs)
+    }
+    
+    /// Integrate vision embeddings at proper positions (matching Qwen2.5-VL behavior)
+    fn integrate_vision_embeddings(
+        &self, 
+        text_embeds: &Tensor, 
+        vision_embeds: &Tensor, 
+        input_ids: &Tensor
+    ) -> Result<Tensor> {
+        // Implement proper masked_scatter like Python Qwen2_5_VLModel
+        // Python: inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        
+        let (batch_size, seq_len, hidden_size) = text_embeds.dims3()?;
+        let (num_vision_tokens, _) = vision_embeds.dims2()?;
+        
+        let image_token_id = 151655u32; // <|image_pad|> token ID
+        
+        // Create image mask: find positions where input_ids == image_token_id
+        let image_mask = self.create_image_token_mask(input_ids, image_token_id)?;
+        
+        // Count image tokens to verify we have the right number
+        let image_token_count = self.count_image_tokens(input_ids, image_token_id)?;
+        
+        if image_token_count == 0 {
+            // No image tokens, return original text embeddings
+            return Ok(text_embeds.clone());
+        }
+        
+        // Verify we have the right number of vision embeddings
+        if image_token_count != num_vision_tokens {
+            eprintln!("Warning: image token count ({}) != vision embeddings ({})", 
+                     image_token_count, num_vision_tokens);
+        }
+        
+        // Implement masked_scatter: replace image token positions with vision embeddings
+        let mut result = text_embeds.clone();
+        
+        for b in 0..batch_size {
+            let mut vision_idx = 0;
+            let batch_input_ids = input_ids.get(b)?; // (seq_len,)
+            let input_data: Vec<u32> = batch_input_ids.to_vec1()?;
+            
+            for seq_idx in 0..seq_len {
+                if input_data[seq_idx] == image_token_id && vision_idx < num_vision_tokens {
+                    // Replace this position with vision embedding
+                    let vision_emb = vision_embeds.get(vision_idx)?; // (hidden_size,)
+                    
+                    // Create a tensor to replace the embedding at [b, seq_idx, :]
+                    let vision_emb_expanded = vision_emb.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, hidden_size)
+                    
+                    // Use slice assignment to replace the position
+                    // result[b:b+1, seq_idx:seq_idx+1, :] = vision_emb_expanded
+                    let start_indices = vec![b, seq_idx, 0];
+                    let end_indices = vec![b + 1, seq_idx + 1, hidden_size];
+                    
+                    // Extract the current slice, replace it, then put it back
+                    let mut result_data = result.flatten_all()?.to_vec1::<f32>()?;
+                    let vision_data = vision_emb.to_vec1::<f32>()?;
+                    
+                    // Calculate the flat index for this position
+                    let flat_idx = (b * seq_len * hidden_size) + (seq_idx * hidden_size);
+                    
+                    // Replace the data
+                    for i in 0..hidden_size {
+                        if flat_idx + i < result_data.len() && i < vision_data.len() {
+                            result_data[flat_idx + i] = vision_data[i];
+                        }
+                    }
+                    
+                    // Reconstruct the tensor
+                    result = Tensor::from_vec(result_data, (batch_size, seq_len, hidden_size), text_embeds.device())?;
+                    
+                    vision_idx += 1;
+                }
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// Create mask for image token positions
+    fn create_image_token_mask(&self, input_ids: &Tensor, image_token_id: u32) -> Result<Tensor> {
+        // Create boolean mask where True indicates image token positions
+        let input_data: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        let mask_data: Vec<f32> = input_data.iter()
+            .map(|&id| if id == image_token_id { 1.0 } else { 0.0 })
+            .collect();
+        
+        let mask = Tensor::from_vec(mask_data, input_ids.shape(), input_ids.device())?;
+        Ok(mask)
+    }
+    
+    /// Count number of image tokens in input_ids
+    fn count_image_tokens(&self, input_ids: &Tensor, image_token_id: u32) -> Result<usize> {
+        let input_data: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        let count = input_data.iter().filter(|&&id| id == image_token_id).count();
+        Ok(count)
+    }
+
+    
+    /// Enhanced forward for proper image token replacement (future enhancement)
+    pub fn forward_with_proper_vision_integration(
+        &self, 
+        input_ids: &Tensor, 
+        vision_embeds: Option<&Tensor>,
+        image_token_id: Option<u32>
+    ) -> Result<Tensor> {
+        let text_embeds = self.embed_tokens.forward(input_ids)?;
+        
+        let xs = if let (Some(vision_embeds), Some(img_token_id)) = (vision_embeds, image_token_id) {
+            // Find image token positions and replace with vision embeddings
+            self.replace_image_tokens(&text_embeds, vision_embeds, input_ids, img_token_id)?
+        } else {
+            text_embeds
+        };
+        
+        // Process through transformer layers
+        let mut xs = xs;
+        for layer in &self.layers {
+            xs = layer.forward(&xs)?;
+        }
+        
+        self.norm.forward(&xs)
+    }
+    
+    /// Replace image tokens with vision embeddings (proper Qwen2.5-VL approach)
+    fn replace_image_tokens(
+        &self,
+        text_embeds: &Tensor,
+        vision_embeds: &Tensor,
+        input_ids: &Tensor,
+        _image_token_id: u32
+    ) -> Result<Tensor> {
+        // This is a placeholder for the full implementation
+        // In the real Qwen2.5-VL, vision embeddings replace image token positions
+        // For now, fall back to the integration approach
+        self.integrate_vision_embeddings(text_embeds, vision_embeds, input_ids)
     }
 }

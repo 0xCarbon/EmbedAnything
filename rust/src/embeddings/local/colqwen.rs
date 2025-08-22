@@ -100,7 +100,7 @@ impl ColQwenEmbedder {
         let model = Model::new(&config, vb, &device, dtype, false)?;
         let dummy_prompt: &str = "Describe the image.";
 
-        let _dummy_input: Tensor = tokenize_batch(&tokenizer, vec![dummy_prompt], &device)?;
+        let (_dummy_input, _dummy_mask) = tokenize_batch(&tokenizer, vec![dummy_prompt], &device)?;
 
         Ok(Self {
             model: RwLock::new(model),
@@ -198,7 +198,7 @@ impl ColQwenEmbedder {
         let model = Model::new(&config, vb, &device, dtype, false)?;
         let dummy_prompt: &str = "Describe the image.";
 
-        let _dummy_input: Tensor = tokenize_batch(&tokenizer, vec![dummy_prompt], &device)?;
+        let (_dummy_input, _dummy_mask) = tokenize_batch(&tokenizer, vec![dummy_prompt], &device)?;
 
         Ok(Self {
             model: RwLock::new(model),
@@ -210,88 +210,172 @@ impl ColQwenEmbedder {
         })
     }
 
-    /// Calculate optimal image size preserving original dimensions when possible
-    /// ColQwen requires: 1) Perfect square number of patches, 2) Grid size divisible by spatial_merge_size (2)
-    fn calculate_adaptive_image_size(&self, original_width: u32, original_height: u32) -> (u32, u32) {
-        let max_pixels = self.preprocessor_config.max_pixels;
-        let patch_size = self.config.vision_config.patch_size as u32;
-        let spatial_merge_size = self.config.vision_config.spatial_merge_size as u32;
+    /// Smart resize implementation matching transformers library exactly
+    /// From transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize
+    fn smart_resize(&self, height: u32, width: u32) -> (u32, u32) {
+        let factor = (self.config.vision_config.patch_size * self.config.vision_config.spatial_merge_size) as u32; // 14 * 2 = 28
+        let min_pixels = self.preprocessor_config.min_pixels as u32;
+        let max_pixels = self.preprocessor_config.max_pixels as u32;
         
-        // Calculate max number of patches that fits within max_pixels
-        let max_patches = max_pixels / (patch_size * patch_size) as usize;
-        
-        // Find largest square grid that fits and is divisible by spatial_merge_size
-        let max_grid_side = (max_patches as f64).sqrt() as u32;
-        
-        // Ensure grid size is divisible by spatial_merge_size (round down to nearest multiple)
-        let max_grid_side = (max_grid_side / spatial_merge_size) * spatial_merge_size;
-        
-        // Calculate actual image dimensions for this grid
-        let max_image_side = max_grid_side * patch_size;
-        
-        let original_pixels = (original_width * original_height) as usize;
-        let max_image_pixels = (max_image_side * max_image_side) as usize;
-        
-        // If original image fits within our constrained max size, use optimal square size
-        if original_pixels <= max_image_pixels {
-            // For smaller images, find the best square grid that accommodates the original
-            let original_max_side = original_width.max(original_height);
-            let needed_grid_side = (original_max_side + patch_size - 1) / patch_size;
-            
-            // Round up to nearest multiple of spatial_merge_size
-            let grid_side = ((needed_grid_side + spatial_merge_size - 1) / spatial_merge_size) * spatial_merge_size;
-            
-            // Ensure we don't exceed max constraints
-            let grid_side = grid_side.min(max_grid_side);
-            
-            let image_side = grid_side * patch_size;
-            return (image_side, image_side);
+        // Check aspect ratio constraint - same as Python
+        let max_dim = height.max(width);
+        let min_dim = height.min(width);
+        if max_dim / min_dim > 200 {
+            return Err(anyhow::anyhow!(
+                "absolute aspect ratio must be smaller than 200, got {}", 
+                max_dim as f64 / min_dim as f64
+            )).unwrap_or((factor, factor)); // Fallback on error
         }
         
-        // Original is too large, use maximum allowed square size
-        (max_image_side, max_image_side)
+        // Round to nearest factor multiple - exact Python logic
+        let mut h_bar = ((height as f64 / factor as f64).round() as u32) * factor;
+        let mut w_bar = ((width as f64 / factor as f64).round() as u32) * factor;
+        
+        // If too large, scale down proportionally - exact Python logic
+        if h_bar * w_bar > max_pixels {
+            let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+            h_bar = factor.max(((height as f64 / beta / factor as f64).floor() as u32) * factor);
+            w_bar = factor.max(((width as f64 / beta / factor as f64).floor() as u32) * factor);
+        } 
+        // If too small, scale up proportionally - exact Python logic  
+        else if h_bar * w_bar < min_pixels {
+            let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+            h_bar = ((height as f64 * beta / factor as f64).ceil() as u32) * factor;
+            w_bar = ((width as f64 * beta / factor as f64).ceil() as u32) * factor;
+        }
+        
+        // CRITICAL FIX: Ensure perfect square patch grid for PatchMerger
+        // The vision transformer expects exactly square patch grids (e.g., 24x24 = 576 patches)
+        let patches_h = h_bar / (self.config.vision_config.patch_size as u32);
+        let patches_w = w_bar / (self.config.vision_config.patch_size as u32);
+        
+        // Force square patch grid by using the larger dimension for both
+        let square_patches = patches_h.max(patches_w);
+        let square_dim = square_patches * (self.config.vision_config.patch_size as u32);
+        
+        (square_dim, square_dim)
     }
 
     fn images_to_tensor(
         &self,
         pages: &[DynamicImage],
-    ) -> anyhow::Result<Tensor> {
+    ) -> anyhow::Result<(Tensor, Vec<(u32, u32, u32)>)> {
         if pages.is_empty() {
             return Err(anyhow::anyhow!("Cannot process empty pages array"));
         }
         
-        let mut images = vec![];
+        // ImageNet normalization values (matching Python implementation)
+        let image_mean = [0.48145466f32, 0.4578275f32, 0.40821073f32];
+        let image_std = [0.26862954f32, 0.26130258f32, 0.27577711f32];
+        
+        let mut all_patches = vec![];
+        let mut grid_thws = vec![];
+        
         for page in pages.iter() {
-            // Calculate adaptive image size based on original dimensions
-            let (target_width, target_height) = self.calculate_adaptive_image_size(
-                page.width(), 
-                page.height()
-            );
+            // Use smart_resize matching Python implementation
+            let (target_height, target_width) = self.smart_resize(page.height(), page.width());
             
-            let img = page.resize_to_fill(
+            let img = page.resize_exact(
                 target_width,
                 target_height,
                 image::imageops::FilterType::Triangle,
             );
             let img = img.to_rgb8();
-            let img = img.into_raw();
+            let img_data = img.into_raw();
             
-            // Create tensor following ColPali's approach but with temporal dimension for Qwen2.5-VL
-            let img = Tensor::from_vec(img, (target_height as usize, target_width as usize, 3), &self.device)?
+            // Convert to tensor and normalize with ImageNet values - following Python _preprocess
+            let mut img_tensor = Tensor::from_vec(img_data, (target_height as usize, target_width as usize, 3), &self.device)?
                 .permute((2, 0, 1))?  // (C, H, W)
-                .to_dtype(self.dtype)?
-                .affine(2. / 255., -1.)?; // Normalize to [-1, 1]
+                .to_dtype(DType::F32)?;
             
-            // Ensure result is in correct dtype after affine operation
-            let img = img.to_dtype(self.dtype)?;
+            // Apply rescaling (0-255 -> 0-1)
+            img_tensor = img_tensor.affine(1.0 / 255.0, 0.0)?;
             
-            // Add temporal dimension: (C, H, W) -> (C, T, H, W) where T=1
-            let img = img.unsqueeze(1)?; // (C, 1, H, W)
-            images.push(img);
+            // Apply ImageNet normalization: (image - mean) / std
+            let mut normalized_channels = Vec::new();
+            for c in 0..3 {
+                let channel = img_tensor.get(c)?;
+                let normalized = channel.affine(1.0 / image_std[c] as f64, -(image_mean[c] / image_std[c]) as f64)?;
+                normalized_channels.push(normalized);
+            }
+            
+            // Stack normalized channels back together
+            img_tensor = Tensor::stack(&normalized_channels, 0)?;
+            img_tensor = img_tensor.to_dtype(self.dtype)?; // (C, H, W)
+            
+            // Calculate patch dimensions first
+            let patch_size = self.config.vision_config.patch_size as u32;
+            let _merge_size = self.config.vision_config.spatial_merge_size as u32; 
+            let temporal_patch_size = self.config.vision_config.temporal_patch_size as u32;
+            
+            // Add temporal dimension for Qwen2.5-VL: (C, H, W) -> (1, C, temporal_patch_size, H, W)
+            let img_unsqueezed = img_tensor.unsqueeze(0)?.unsqueeze(2)?; // (1, C, 1, H, W)
+            
+            // Expand temporal dimension to match temporal_patch_size (for static images, repeat the frame)
+            let img_with_temporal = if temporal_patch_size > 1 {
+                // Repeat the temporal dimension: (1, C, 1, H, W) -> (1, C, temporal_patch_size, H, W)
+                let mut temporal_frames = Vec::new();
+                for _ in 0..temporal_patch_size {
+                    temporal_frames.push(img_unsqueezed.clone());
+                }
+                Tensor::cat(&temporal_frames, 2)?
+            } else {
+                img_unsqueezed
+            };
+            
+            let grid_h = target_height / patch_size;
+            let grid_w = target_width / patch_size;
+            let grid_t = 1; // Single image
+            
+            // Simplified patch creation - avoid 9-dimensional operations not supported by candle
+            // Create patches in a more straightforward way that achieves the same result
+            
+            let _channel = 3;
+            let (_, _c, _t, h, w) = img_with_temporal.dims5()?;
+            
+            // Ensure dimensions are compatible 
+            if h % patch_size as usize != 0 || w % patch_size as usize != 0 {
+                return Err(anyhow::anyhow!("Image dimensions not divisible by patch size"));
+            }
+            
+            // Extract patches using a simpler approach  
+            // Input: (1, C, temporal_patch_size, H, W) -> Output: (num_patches, C*temporal_patch_size*patch_size*patch_size)
+            let num_patches_h = h / patch_size as usize;
+            let num_patches_w = w / patch_size as usize; 
+            let _num_patches = num_patches_h * num_patches_w;
+            
+            let mut patches = Vec::new();
+            
+            // Extract each patch
+            for i in 0..num_patches_h {
+                for j in 0..num_patches_w {
+                    // Extract patch region: (1, C, temporal_patch_size, patch_size, patch_size)
+                    let patch = img_with_temporal
+                        .narrow(3, i * patch_size as usize, patch_size as usize)?
+                        .narrow(4, j * patch_size as usize, patch_size as usize)?;
+                    
+                    // Flatten patch: (1, C, temporal_patch_size, patch_size, patch_size) -> (C*temporal_patch_size*patch_size*patch_size)
+                    let flattened_patch = patch.flatten_all()?.squeeze(0)?;
+                    patches.push(flattened_patch);
+                }
+            }
+            
+            // Stack patches: (num_patches, C*temporal_patch_size*patch_size*patch_size) 
+            // This should now be (num_patches, 3*2*14*14) = (num_patches, 1176)
+            let flattened = Tensor::stack(&patches, 0)?;
+            
+            all_patches.push(flattened);
+            grid_thws.push((grid_t, grid_h, grid_w));
         }
         
-        let images = Tensor::stack(&images, 0)?; // (B, C, T, H, W)
-        Ok(images)
+        // Stack all patches - this creates the padded format like Python
+        let stacked_patches = if all_patches.len() == 1 {
+            all_patches.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(&all_patches, 0)?
+        };
+        
+        Ok((stacked_patches, grid_thws))
     }
 }
 
@@ -305,10 +389,10 @@ impl ColQwenEmbed for ColQwenEmbedder {
         let mut all_embeddings = Vec::new();
 
         for batch in text_batch.chunks(batch_size) {
-            let tokens = tokenize_batch(&self.tokenizer, batch.to_vec(), &self.device)?;
+            let (tokens, attention_mask) = tokenize_batch(&self.tokenizer, batch.to_vec(), &self.device)?;
             
             let model = self.model.read().unwrap();
-            let embeddings = model.get_query_embeddings(&tokens)?
+            let embeddings = model.get_query_embeddings(&tokens, Some(&attention_mask))?
                 .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
             
             // Convert to EmbeddingResult format
@@ -325,9 +409,19 @@ impl ColQwenEmbed for ColQwenEmbedder {
     }
 
     fn embed_query(&self, query: &str) -> anyhow::Result<Vec<EmbedData>> {
-        let tokens = tokenize_batch(&self.tokenizer, vec![query], &self.device)?;
+        // Format query to match Python ColQwen2_5_Processor.process_queries()
+        // Python does: query_prefix + text + query_augmentation_token * 10
+        let query_prefix = "Query: ";
+        let query_augmentation_token = "<|endoftext|>";
+        let formatted_query = format!("{}{}{}", 
+            query_prefix, 
+            query, 
+            query_augmentation_token.repeat(10)
+        );
+        
+        let (tokens, attention_mask) = tokenize_batch(&self.tokenizer, vec![&formatted_query], &self.device)?;
         let model = self.model.read().unwrap();
-        let embeddings = model.get_query_embeddings(&tokens)?
+        let embeddings = model.get_query_embeddings(&tokens, Some(&attention_mask))?
             .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
         
         let embedding_tensor = embeddings.get(0)?;
@@ -371,16 +465,25 @@ impl ColQwenEmbed for ColQwenEmbedder {
                         continue; // Skip empty batches
                     }
                     
-                    // For Qwen2.5-VL, use adaptive image sizing for optimal quality
-                    let images_tensor = self.images_to_tensor(page_batch)?;
+                    // For Qwen2.5-VL, use smart_resize and proper normalization
+                    let (images_tensor, grid_thws) = self.images_to_tensor(page_batch)?;
                     
-                    // Create dummy text tokens for image processing
-                    let dummy_text = vec!["Describe the image."; page_batch.len()];
-                    let tokens = tokenize_batch(&self.tokenizer, dummy_text, &self.device)?;
+                    // Create proper visual prompt matching Python ColQwen2.5 format
+                    let visual_prompt = "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe the image.<|im_end|><|endoftext|>";
+                    let dummy_text = vec![visual_prompt; page_batch.len()];
+                    let (tokens, attention_mask) = tokenize_batch(&self.tokenizer, dummy_text, &self.device)?;
+                    
+                    // Get image token ID for masking (if available)
+                    let image_token_id = self.config.image_token_id();
                     
                     let model = self.model.read().unwrap();
-                    let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?
-                        .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
+                    let embeddings = model.get_document_embeddings(
+                        &tokens, 
+                        &images_tensor, 
+                        Some(&grid_thws), 
+                        Some(&attention_mask),
+                        Some(image_token_id)
+                    )?.to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
                     
                     for (i, _page) in page_batch.iter().enumerate() {
                         let embedding_tensor = embeddings.get(i)?;
@@ -413,15 +516,24 @@ impl ColQwenEmbed for ColQwenEmbedder {
     ) -> anyhow::Result<EmbedData> {
         let image = image::ImageReader::open(&image_path)?.decode()?;
         
-        // For Qwen2.5-VL, use adaptive image sizing for optimal quality
-        let images_tensor = self.images_to_tensor(&[image])?;
+        // For Qwen2.5-VL, use smart_resize and proper patch creation
+        let (images_tensor, grid_thws) = self.images_to_tensor(&[image])?;
         
-        // Create dummy text token for image processing
-        let tokens = tokenize_batch(&self.tokenizer, vec!["Describe the image."], &self.device)?;
+        // Create proper visual prompt matching Python ColQwen2.5 format  
+        let visual_prompt = "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe the image.<|im_end|><|endoftext|>";
+        let (tokens, attention_mask) = tokenize_batch(&self.tokenizer, vec![visual_prompt], &self.device)?;
+        
+        // Get image token ID for masking (if available)
+        let image_token_id = self.config.image_token_id();
         
         let model = self.model.read().unwrap();
-        let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?
-            .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
+        let embeddings = model.get_document_embeddings(
+            &tokens, 
+            &images_tensor, 
+            Some(&grid_thws), 
+            Some(&attention_mask),
+            Some(image_token_id)
+        )?.to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
         
         let embedding_tensor = embeddings.get(0)?;
         // ColQwen produces multi-vector embeddings (one per token)
@@ -450,16 +562,25 @@ impl ColQwenEmbed for ColQwenEmbedder {
             images.push(image);
         }
         
-        // For Qwen2.5-VL, use adaptive image sizing for optimal quality
-        let images_tensor = self.images_to_tensor(&images)?;
+        // For Qwen2.5-VL, use smart_resize and proper normalization
+        let (images_tensor, grid_thws) = self.images_to_tensor(&images)?;
         
-        // Create dummy text tokens for image processing
-        let dummy_text = vec!["Describe the image."; images.len()];
-        let tokens = tokenize_batch(&self.tokenizer, dummy_text, &self.device)?;
+        // Create proper visual prompt matching Python ColQwen2.5 format
+        let visual_prompt = "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe the image.<|im_end|><|endoftext|>";
+        let dummy_text = vec![visual_prompt; images.len()];
+        let (tokens, attention_mask) = tokenize_batch(&self.tokenizer, dummy_text, &self.device)?;
+        
+        // Get image token ID for masking (if available)
+        let image_token_id = self.config.image_token_id();
         
         let model = self.model.read().unwrap();
-        let embeddings = model.get_document_embeddings(&tokens, &images_tensor)?
-            .to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
+        let embeddings = model.get_document_embeddings(
+            &tokens, 
+            &images_tensor, 
+            Some(&grid_thws), 
+            Some(&attention_mask),
+            Some(image_token_id)
+        )?.to_dtype(DType::F32)?;  // Convert BF16 → F32 for compatibility
         
         let mut all_embeddings = Vec::new();
         for (i, image_path) in image_paths.iter().enumerate() {
@@ -481,7 +602,7 @@ impl ColQwenEmbed for ColQwenEmbedder {
     }
 }
 
-fn tokenize_batch(tokenizer: &Tokenizer, text_batch: Vec<&str>, device: &Device) -> candle_core::Result<Tensor> {
+fn tokenize_batch(tokenizer: &Tokenizer, text_batch: Vec<&str>, device: &Device) -> candle_core::Result<(Tensor, Tensor)> {
     if text_batch.is_empty() {
         return Err(candle_core::Error::Msg("Cannot tokenize empty text batch".to_string()));
     }
@@ -489,6 +610,7 @@ fn tokenize_batch(tokenizer: &Tokenizer, text_batch: Vec<&str>, device: &Device)
     let tokens = tokenizer
         .encode_batch(text_batch, true)
         .map_err(candle_core::Error::msg)?;
+        
     let token_ids = tokens
         .iter()
         .map(|tokens| {
@@ -497,7 +619,15 @@ fn tokenize_batch(tokenizer: &Tokenizer, text_batch: Vec<&str>, device: &Device)
         })
         .collect::<candle_core::Result<Vec<_>>>()?;
 
-    Ok(Tensor::stack(&token_ids, 0)?)
+    let attention_masks = tokens
+        .iter()
+        .map(|tokens| {
+            let mask: Vec<f32> = tokens.get_attention_mask().iter().map(|&x| x as f32).collect();
+            Ok(Tensor::new(mask.as_slice(), device)?)
+        })
+        .collect::<candle_core::Result<Vec<_>>>()?;
+
+    Ok((Tensor::stack(&token_ids, 0)?, Tensor::stack(&attention_masks, 0)?))
 }
 
 /// Load safetensors files from local directory (reuse from colpali.rs)

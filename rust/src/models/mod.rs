@@ -2,6 +2,7 @@ pub mod bert;
 pub mod clip;
 pub mod colpali;
 pub mod gemma;
+pub mod granite;
 pub mod jina_bert;
 pub mod modernbert;
 pub mod paligemma;

@@ -81,9 +81,9 @@ impl Model {
 }
 
 impl Model {
-    /// Get query embeddings (for text queries) - ColPali style without explicit attention masks
-    pub fn get_query_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        // Follow ColPali pattern: direct language model call without attention masks
+    /// Get query embeddings (for text queries) - ColPali style with attention mask support
+    pub fn get_query_embeddings(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        // Follow ColPali pattern: direct language model call
         let last_hidden_states = self.language_model.forward(input_ids)?;
         
         // Apply custom projection to get ColPali-style embeddings
@@ -91,17 +91,37 @@ impl Model {
         
         // L2 normalization
         let norm = proj.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
-        let proj = proj.broadcast_div(&norm)?;
+        let mut proj = proj.broadcast_div(&norm)?;
+        
+        // Apply attention mask if provided (zeroes out padding tokens)
+        if let Some(mask) = attention_mask {
+            let expanded_mask = mask.unsqueeze(D::Minus1)?.broadcast_as(proj.shape())?;
+            proj = proj.broadcast_mul(&expanded_mask)?;
+        }
         
         Ok(proj)
     }
     
-    /// Get document embeddings (for images/documents) - simplified approach
-    pub fn get_document_embeddings(&self, input_ids: &Tensor, pixel_values: &Tensor) -> Result<Tensor> {
-        // Process vision inputs
-        let vision_embeds = self.visual.forward(pixel_values)?;
+    /// Get document embeddings (for images/documents) - full ColPali approach with unpadding
+    pub fn get_document_embeddings(
+        &self, 
+        input_ids: &Tensor, 
+        pixel_values: &Tensor, 
+        image_grid_thw: Option<&[(u32, u32, u32)]>,
+        attention_mask: Option<&Tensor>,
+        image_token_id: Option<u32>,
+    ) -> Result<Tensor> {
+        // Apply unpadding logic matching Python ColQwen2.5 - BEFORE vision processing
+        let unpadded_pixel_values = if let Some(grid_thw) = image_grid_thw {
+            self.apply_unpadding_to_patches(pixel_values, grid_thw)?
+        } else {
+            pixel_values.clone()
+        };
         
-        // Forward with vision embeddings (simplified)
+        // Process vision inputs with properly unpadded flattened patches  
+        let vision_embeds = self.visual.forward_flattened_patches(&unpadded_pixel_values)?;
+        
+        // Forward with vision embeddings
         let last_hidden_states = self.language_model.forward_with_vision(input_ids, Some(&vision_embeds))?;
         
         // Apply custom projection to get ColPali-style embeddings
@@ -109,9 +129,87 @@ impl Model {
         
         // L2 normalization
         let norm = proj.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
-        let proj = proj.broadcast_div(&norm)?;
+        let mut proj = proj.broadcast_div(&norm)?;
+        
+        // Apply attention mask if provided (zeroes out padding tokens)
+        if let Some(mask) = attention_mask {
+            // If we integrated vision embeddings, we need to expand the attention mask
+            let adjusted_mask = if let Some(_) = image_grid_thw {
+                // Vision embeddings were integrated, so we need to expand the mask
+                // Vision tokens get mask value of 1.0 (always attend), text tokens use original mask
+                let (batch_size, original_seq_len) = mask.dims2()?;
+                let (_, current_seq_len, _) = proj.dims3()?;
+                
+                if current_seq_len > original_seq_len {
+                    // Calculate number of vision tokens added
+                    let num_vision_tokens = current_seq_len - original_seq_len;
+                    
+                    // Create vision mask (all 1s for vision tokens)
+                    let vision_mask = Tensor::ones((batch_size, num_vision_tokens), mask.dtype(), mask.device())?;
+                    
+                    // Concatenate: [vision_mask, original_mask]
+                    Tensor::cat(&[&vision_mask, mask], 1)?
+                } else {
+                    mask.clone()
+                }
+            } else {
+                mask.clone()
+            };
+            
+            let expanded_mask = adjusted_mask.unsqueeze(D::Minus1)?.broadcast_as(proj.shape())?;
+            proj = proj.broadcast_mul(&expanded_mask)?;
+        }
+        
+        // Apply image token masking if requested (only pool image embeddings)
+        if self.mask_non_image_embeddings {
+            if let Some(img_token_id) = image_token_id {
+                let image_mask = self.create_image_token_mask(input_ids, img_token_id)?;
+                let expanded_image_mask = image_mask.unsqueeze(D::Minus1)?.broadcast_as(proj.shape())?;
+                proj = proj.broadcast_mul(&expanded_image_mask)?;
+            }
+        }
         
         Ok(proj)
+    }
+    
+    /// Apply unpadding logic to flattened patches matching Python ColQwen2.5
+    fn apply_unpadding_to_patches(&self, pixel_values: &Tensor, image_grid_thw: &[(u32, u32, u32)]) -> Result<Tensor> {
+        // Python ColQwen2.5: offsets = image_grid_thw[:, 1] * image_grid_thw[:, 2]  # grid_h * grid_w
+        // Then: pixel_sequence[:offset] for each image
+        
+        let mut unpadded_sequences = Vec::new();
+        let mut current_idx = 0;
+        
+        for &(_grid_t, grid_h, grid_w) in image_grid_thw {
+            let num_patches = (grid_h * grid_w) as usize; // Matches Python: grid_h * grid_w (NOT including grid_t)
+            
+            // Extract patches for this image from the flattened patches tensor
+            // pixel_values shape: (total_patches, patch_feature_dim)
+            let image_patches = pixel_values.narrow(0, current_idx, num_patches)?;
+            unpadded_sequences.push(image_patches);
+            
+            // Move to next image's patches
+            current_idx += num_patches;
+        }
+        
+        // Concatenate all unpadded sequences - matches Python torch.cat behavior
+        if unpadded_sequences.is_empty() {
+            Ok(pixel_values.clone())
+        } else {
+            Tensor::cat(&unpadded_sequences, 0)
+        }
+    }
+    
+    /// Create image token mask for selective embedding pooling
+    fn create_image_token_mask(&self, input_ids: &Tensor, image_token_id: u32) -> Result<Tensor> {
+        // Create mask where 1.0 = image token, 0.0 = other tokens
+        let image_token_tensor = Tensor::new(&[image_token_id], input_ids.device())?
+            .to_dtype(input_ids.dtype())?
+            .broadcast_as(input_ids.shape())?;
+        
+        // Compare input_ids with image_token_id
+        let mask = input_ids.eq(&image_token_tensor)?.to_dtype(self.dtype)?;
+        Ok(mask)
     }
 }
 
