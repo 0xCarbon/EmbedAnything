@@ -106,6 +106,84 @@ impl Qwen3Embedder {
             device,
         })
     }
+    
+    /// Create a Qwen3Embedder from local files
+    pub fn from_local_files(
+        model_dir: &str,
+        tokenizer_path: Option<&str>,
+    ) -> Result<Self, anyhow::Error> {
+        let model_path = std::path::Path::new(model_dir);
+        
+        // Look for safetensors files
+        let weights_filename = if model_path.join("model.safetensors.index.json").exists() {
+            // Multi-file safetensors
+            hub_load_safetensors_from_local(model_path, "model.safetensors.index.json")?
+        } else if model_path.join("model.safetensors").exists() {
+            // Single safetensors file
+            vec![model_path.join("model.safetensors")]
+        } else {
+            return Err(anyhow::anyhow!(
+                "No safetensors files found in {}. Expected model.safetensors or model.safetensors.index.json",
+                model_dir
+            ));
+        };
+
+        // Load config
+        let config_file = model_path.join("config.json");
+        if !config_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Config file not found: {}. Qwen3 models require a config.json file.",
+                config_file.display()
+            ));
+        }
+
+        let config_str = std::fs::read_to_string(config_file)?;
+        let config: Config = serde_json::from_str(&config_str)?;
+
+        // Load tokenizer
+        let tokenizer_file = if let Some(tokenizer_path) = tokenizer_path {
+            std::path::Path::new(tokenizer_path).to_path_buf()
+        } else if model_path.join("tokenizer.json").exists() {
+            model_path.join("tokenizer.json")
+        } else {
+            return Err(anyhow::anyhow!(
+                "Tokenizer file not found. Please provide tokenizer.json in {} or specify tokenizer_path",
+                model_dir
+            ));
+        };
+
+        let mut tokenizer = Tokenizer::from_file(tokenizer_file).map_err(Error::msg)?;
+        
+        let pp = PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: tokenizers::PaddingDirection::Left,
+            ..Default::default()
+        };
+        let trunc = TruncationParams {
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            max_length: 1024,
+            ..Default::default()
+        };
+
+        tokenizer
+            .with_padding(Some(pp))
+            .with_truncation(Some(trunc))
+            .map_err(Error::msg)?;
+
+        let device = select_device();
+
+        let dtype = DType::F32; // Keep it simple for Qwen3
+
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights_filename, dtype, &device)? };
+
+        let model = Model::new(&config, vb)?;
+
+        Ok(Self {
+            model: std::sync::RwLock::new(model),
+            tokenizer,
+            device,
+        })
+    }
 }
 
 impl Qwen3Embed for Qwen3Embedder {
@@ -150,6 +228,40 @@ impl Qwen3Embed for Qwen3Embedder {
         Ok(encodings)
     }
 }
+/// Load safetensors files from local directory
+pub fn hub_load_safetensors_from_local(
+    model_dir: &std::path::Path,
+    json_file: &str,
+) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    let json_file_path = model_dir.join(json_file);
+    let json_file = std::fs::File::open(&json_file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", json_file_path.display(), e))?;
+    let json: serde_json::Value =
+        serde_json::from_reader(&json_file).map_err(|e| anyhow::anyhow!("JSON parsing error: {}", e))?;
+    let weight_map = match json.get("weight_map") {
+        None => anyhow::bail!("no weight map in {:?}", json_file_path),
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => anyhow::bail!("weight map in {:?} is not a map", json_file_path),
+    };
+    let mut safetensors_files = std::collections::HashSet::new();
+    for value in weight_map.values() {
+        if let Some(file) = value.as_str() {
+            safetensors_files.insert(file.to_string());
+        }
+    }
+    let safetensors_files = safetensors_files
+        .iter()
+        .map(|filename| {
+            let file_path = model_dir.join(filename);
+            if !file_path.exists() {
+                anyhow::bail!("Safetensors file not found: {}", file_path.display());
+            }
+            Ok(file_path)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(safetensors_files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
